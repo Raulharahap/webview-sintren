@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:fluttertoast/fluttertoast.dart';
+import 'package:url_launcher/url_launcher.dart';
 import 'package:webview_flutter/webview_flutter.dart';
 import 'package:webview_flutter_android/webview_flutter_android.dart';
 import 'package:permission_handler/permission_handler.dart';
@@ -17,31 +18,20 @@ class _WebViewScreenState extends State<WebViewScreen> {
   WebViewController? _controller;
   bool _isError = false;
   bool _isExitPressed = false;
+  // Variabel `_isLoadingPage` dihapus karena loading indicator Flutter tidak digunakan lagi
 
   @override
   void initState() {
     super.initState();
     WidgetsBinding.instance.addPostFrameCallback((_) {
-      // Panggil satu fungsi utama untuk semua proses setup
       _initializeWebView();
     });
   }
 
-  // Fungsi async utama untuk setup yang lebih terstruktur
   Future<void> _initializeWebView() async {
-    // Langkah 1: Pastikan GPS dan Izin sudah siap.
-    // Jika tidak, proses akan berhenti dan menampilkan halaman error.
-    final bool locationReady = await _ensureLocationEnabledAndPermission();
-    if (!locationReady) {
-      if (mounted) {
-        setState(() {
-          _isError = true;
-        });
-      }
-      return;
-    }
+    // Cek GPS & Izin. Jika ditolak, aplikasi tetap lanjut.
+    await _ensureLocationEnabledAndPermission();
 
-    // Langkah 2: Jika lokasi sudah siap, baru setup WebView Controller.
     late final PlatformWebViewControllerCreationParams params;
     if (WebViewPlatform.instance is AndroidWebViewPlatform) {
       params = AndroidWebViewControllerCreationParams();
@@ -74,111 +64,104 @@ class _WebViewScreenState extends State<WebViewScreen> {
       ..setBackgroundColor(const Color(0x00000000))
       ..setNavigationDelegate(
         NavigationDelegate(
+          // onPageStarted dan onPageFinished dihapus untuk menghilangkan loading indicator Flutter
           onWebResourceError: (WebResourceError error) {
             if (error.isForMainFrame ?? false) {
-              if (mounted) {
+              if (mounted)
                 setState(() {
                   _isError = true;
                 });
-              }
             }
+          },
+          // INI SOLUSI UNTUK LINK EKSTERNAL (FB, WA, DLL)
+          onNavigationRequest: (NavigationRequest request) {
+            final uri = Uri.parse(request.url);
+            // Jika link BUKAN dari website utama, buka di luar.
+            if (!uri.host.contains('sintren.indramayukab.go.id')) {
+              launchUrl(uri, mode: LaunchMode.externalApplication);
+              return NavigationDecision
+                  .prevent; // Hentikan WebView membuka link
+            }
+            return NavigationDecision.navigate; // Izinkan WebView membuka link
           },
         ),
       );
 
     if (controller.platform is AndroidWebViewController) {
-      final androidController = controller.platform as AndroidWebViewController;
-      androidController.setGeolocationEnabled(true);
-      // Handler izin lokasi dari webview sekarang menggunakan permission_handler
-      androidController.setGeolocationPermissionsPromptCallbacks(
-        onShowPrompt:
-            (GeolocationPermissionsRequestParams requestParams) async {
-              final status = await Permission.location.request();
-              return GeolocationPermissionsResponse.new(
-                allow: status.isGranted,
-                retain: false,
-              );
-            },
-        onHidePrompt: () {},
-      );
+      (controller.platform as AndroidWebViewController)
+        ..setGeolocationEnabled(true)
+        ..setGeolocationPermissionsPromptCallbacks(
+          onShowPrompt:
+              (GeolocationPermissionsRequestParams requestParams) async {
+                final status = await Permission.location.request();
+                return GeolocationPermissionsResponse.new(
+                  allow: status.isGranted,
+                  retain: false,
+                );
+              },
+        );
     }
 
-    // Langkah 3: Simpan controller ke state untuk menampilkan UI WebView
     if (mounted) {
       setState(() {
         _controller = controller;
       });
     }
 
-    // Langkah 4: Terakhir, muat URL-nya
     await _controller?.loadRequest(
       Uri.parse('https://sintren.indramayukab.go.id/'),
     );
   }
 
-  // == FUNGSI INI DIPERBAIKI SECARA TOTAL UNTUK MENGATASI RACE CONDITION ==
-  Future<bool> _ensureLocationEnabledAndPermission() async {
-    // Langkah 1: Minta Izin Aplikasi terlebih dahulu. Ini harus jadi yang pertama.
-    PermissionStatus permissionStatus = await Permission.location.status;
-    if (permissionStatus.isDenied) {
-      // isDenied berarti belum pernah ditanya atau ditolak sekali.
-      // Minta izin sekarang. Ini akan menampilkan dialog sistem untuk izin aplikasi.
-      permissionStatus = await Permission.location.request();
-    }
+  // == LOGIKA IZIN & GPS DIPERBAIKI TOTAL ==
+  Future<void> _ensureLocationEnabledAndPermission() async {
+    // 1. Minta izin lokasi aplikasi terlebih dahulu
+    PermissionStatus permissionStatus = await Permission.location.request();
 
     if (permissionStatus.isPermanentlyDenied) {
-      // Pengguna menolak permanen. Beri tahu dan ajak ke pengaturan.
       Fluttertoast.showToast(
         msg: 'Izin lokasi ditolak permanen. Aktifkan di pengaturan aplikasi.',
       );
       await openAppSettings();
-      return false;
+      return;
     }
 
     if (!permissionStatus.isGranted) {
-      // Pengguna menolak izin (tapi bukan permanen).
       Fluttertoast.showToast(
-        msg: 'Aplikasi membutuhkan izin lokasi untuk berfungsi.',
+        msg: 'Aplikasi ini bekerja lebih baik dengan izin lokasi.',
       );
-      return false;
+      // Tetap lanjutkan meskipun izin ditolak
     }
 
-    // --- Jika sampai sini, berarti izin aplikasi SUDAH DIBERIKAN ---
-
-    // Langkah 2: BARU setelah izin aplikasi ada, cek layanan GPS perangkat.
-    final loc.Location locationService = loc.Location();
-    bool serviceEnabled;
-    try {
-      serviceEnabled = await locationService.serviceEnabled();
-      if (!serviceEnabled) {
-        // Minta pengguna untuk menyalakan GPS-nya.
-        // Ini akan menampilkan dialog sistem kedua (untuk mengaktifkan GPS).
-        serviceEnabled = await locationService.requestService();
+    // 2. Jika izin ada (atau baru diberikan), baru cek layanan GPS
+    if (permissionStatus.isGranted) {
+      final loc.Location locationService = loc.Location();
+      bool serviceEnabled;
+      try {
+        serviceEnabled = await locationService.serviceEnabled();
         if (!serviceEnabled) {
-          // Pengguna menolak menyalakan GPS.
-          Fluttertoast.showToast(
-            msg:
-                'Untuk pengalaman yang lebih baik, aktifkan GPS di perangkat Anda.',
-          );
-          return false;
+          serviceEnabled = await locationService.requestService();
+          if (!serviceEnabled) {
+            // == PERBAIKAN: KATA-KATA TOAST DISESUAIKAN ==
+            Fluttertoast.showToast(
+              msg: 'Fitur cuaca akan lebih akurat jika Anda mengaktifkan GPS.',
+            );
+            // Tetap lanjutkan meskipun GPS tidak diaktifkan
+          }
         }
+      } catch (e) {
+        debugPrint("Error checking location service: $e");
       }
-    } catch (e) {
-      // Menangani jika ada error tak terduga saat mengecek service GPS
-      Fluttertoast.showToast(msg: 'Gagal memeriksa status layanan lokasi.');
-      return false;
     }
-
-    // Jika semua berhasil (izin diberikan DAN GPS aktif)
-    return true;
   }
 
   void _retryLoading() {
     setState(() {
       _isError = false;
-      // Panggil kembali fungsi setup utama untuk mencoba lagi dari awal
-      _initializeWebView();
+      _controller = null; // Reset controller
     });
+    // Panggil kembali fungsi setup utama
+    _initializeWebView();
   }
 
   @override
@@ -204,7 +187,7 @@ class _WebViewScreenState extends State<WebViewScreen> {
               textColor: Colors.white,
               fontSize: 16.0,
             );
-            Future.delayed(const Duration(seconds: 5), () {
+            Future.delayed(const Duration(seconds: 2), () {
               if (mounted) {
                 setState(() {
                   _isExitPressed = false;
@@ -216,38 +199,38 @@ class _WebViewScreenState extends State<WebViewScreen> {
       },
       child: Scaffold(
         body: SafeArea(
-          child: _controller == null && !_isError
-              ? const Center(child: CircularProgressIndicator())
-              : !_isError
-              ? WebViewWidget(controller: _controller!)
-              : Center(
+          child: Stack(
+            children: [
+              // Tampilkan WebView jika sudah siap dan tidak error
+              if (_controller != null && !_isError)
+                WebViewWidget(controller: _controller!),
+
+              // Tampilkan halaman error jika terjadi masalah
+              if (_isError)
+                Center(
                   child: Padding(
                     padding: const EdgeInsets.all(20.0),
                     child: Column(
                       mainAxisAlignment: MainAxisAlignment.center,
                       children: [
-                        Icon(
+                        const Icon(
                           Icons.cloud_off_outlined,
                           size: 120,
-                          color: Colors.grey[600],
+                          color: Colors.grey,
                         ),
                         const SizedBox(height: 20),
                         const Text(
-                          'Gagal Memuat Halaman',
+                          'Koneksi Gagal',
                           style: TextStyle(
-                            fontSize: 18,
+                            fontSize: 20,
                             fontWeight: FontWeight.bold,
                           ),
-                          textAlign: TextAlign.center,
                         ),
                         const SizedBox(height: 10),
-                        Text(
-                          'Periksa kembali koneksi internet Anda lalu coba lagi.', /////mundur dulu
-                          style: TextStyle(
-                            fontSize: 14,
-                            color: Colors.grey[600],
-                          ),
+                        const Text(
+                          'Periksa kembali koneksi internet Anda lalu coba lagi.',
                           textAlign: TextAlign.center,
+                          style: TextStyle(color: Colors.grey),
                         ),
                         const SizedBox(height: 30),
                         ElevatedButton.icon(
@@ -270,6 +253,8 @@ class _WebViewScreenState extends State<WebViewScreen> {
                     ),
                   ),
                 ),
+            ],
+          ),
         ),
       ),
     );
